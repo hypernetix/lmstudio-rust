@@ -1,0 +1,62 @@
+[package]
+name = "lmstudio-rust"
+version = "0.1.0"
+edition = "2021"
+authors = ["Artifizer <artifizer@gmail.com>"]
+description = "Rust client library for LM Studio with CLI interface, using LM Studio websocket API"
+license = "Apache-2.0"
+repository = "https://github.com/hypernetix/lmstudio-rust"
+keywords = ["lmstudio", "llm", "websocket", "cli"]
+categories = ["api-bindings", "command-line-utilities"]
+
+[[bin]]
+name = "lms-rust"
+path = "src/bin/lms.rs"
+
+[dependencies]
+# WebSocket support
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio = { version = "1.0", features = ["full"] }
+
+# JSON handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client for discovery
+reqwest = { version = "0.11", features = ["json"] }
+
+# CLI support
+clap = { version = "4.4", features = ["derive"] }
+
+# Async utilities
+futures-util = "0.3"
+futures = "0.3"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# UUID generation
+uuid = { version = "1.0", features = ["v4"] }
+
+# URL parsing
+url = "2.4"
+
+# Progress bars for CLI
+indicatif = "0.17"
+
+# Table formatting for CLI
+tabled = "0.15"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Random number generation
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
