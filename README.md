@@ -57,6 +57,18 @@ cargo build --release
 
 // TODO
 
+## TODO
+
+Some features are still being implemented:
+
+- [ ] Complete streaming chat implementation
+- [ ] Binary message handling for channels
+- [ ] Advanced model loading configurations
+- [ ] Embedding model operations
+- [ ] Connection pooling and reconnection logic
+- [ ] More comprehensive error handling
+- [ ] Performance optimizations
+
 ## License
 
 This project is licensed under the [Apache 2.0 License](LICENSE).
