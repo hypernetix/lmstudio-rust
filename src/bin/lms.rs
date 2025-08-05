@@ -362,9 +362,9 @@ async fn main() -> Result<()> {
         Commands::Status => {
             let is_running = client.check_status().await?;
             if is_running {
-                println!("✓ LM Studio is running and accessible");
+                println!("OK, LM Studio is running and accessible");
             } else {
-                println!("✗ LM Studio is not accessible");
+                println!("Err, LM Studio is not accessible");
                 std::process::exit(1);
             }
         }
