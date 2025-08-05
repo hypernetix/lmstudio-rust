@@ -118,14 +118,46 @@ pub struct LoadingProgress {
     pub model_info: Option<Model>,
 }
 
-/// WebSocket message types used internally
+/// WebSocket message types used internally for RPC calls
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RpcCallMessage {
+    #[serde(rename = "callId")]
+    pub call_id: i32,
+    pub endpoint: String,
+    #[serde(rename = "type")]
+    pub message_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+/// WebSocket message types used internally for RPC responses
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RpcResponseMessage {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    #[serde(rename = "callId")]
+    pub call_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+}
+
+/// Generic WebSocket message for parsing
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WebSocketMessage {
-    pub id: Option<i32>,
-    pub method: Option<String>,
-    pub params: Option<serde_json::Value>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<String>,
+    #[serde(rename = "callId", skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
 }
 
 /// Parameters for remote procedure calls

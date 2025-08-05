@@ -2,15 +2,16 @@
 
 use crate::error::{LMStudioError, Result};
 use crate::logger::Logger;
-use crate::types::WebSocketMessage;
+use crate::types::{RpcCallMessage, WebSocketMessage};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 use url::Url;
+use uuid::Uuid;
 
 
 /// Channel handler trait for different types of message handlers
@@ -53,8 +54,64 @@ impl NamespaceConnection {
         let (ws_stream, _) = connect_async(&ws_url).await
             .map_err(|e| LMStudioError::connection(format!("Failed to connect to {}: {}", ws_url, e)))?;
 
-        let (ws_sender, ws_receiver) = ws_stream.split();
+        let (mut ws_sender, ws_receiver) = ws_stream.split();
         let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Perform authentication handshake
+        let client_identifier = Uuid::new_v4().to_string();
+        let client_passkey = Uuid::new_v4().to_string();
+
+        let auth_msg = json!({
+            "authVersion": 1,
+            "clientIdentifier": client_identifier,
+            "clientPasskey": client_passkey
+        });
+
+        self.logger.debug(&format!("Sending authentication message to {}: {}", self.namespace, auth_msg));
+
+        // Send authentication message
+        let auth_text = serde_json::to_string(&auth_msg)
+            .map_err(|e| LMStudioError::connection(format!("Failed to serialize auth message: {}", e)))?;
+
+        ws_sender.send(Message::Text(auth_text)).await
+            .map_err(|e| LMStudioError::connection(format!("Failed to send auth message: {}", e)))?;
+
+        // Wait for authentication response with timeout
+        let mut ws_receiver = ws_receiver; // Make mutable for next() call
+        let auth_response = timeout(Duration::from_secs(15), ws_receiver.next()).await
+            .map_err(|_| LMStudioError::connection("Authentication timeout"))?;
+
+        match auth_response {
+            Some(Ok(Message::Text(response_text))) => {
+                let auth_result: Value = serde_json::from_str(&response_text)
+                    .map_err(|e| LMStudioError::connection(format!("Failed to parse auth response: {}", e)))?;
+
+                self.logger.debug(&format!("Received authentication response from {}: {}", self.namespace, auth_result));
+
+                // Check for success
+                if let Some(success) = auth_result.get("success").and_then(|v| v.as_bool()) {
+                    if !success {
+                        let error_msg = auth_result.get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Authentication failed");
+                        return Err(LMStudioError::connection(format!("Authentication failed: {}", error_msg)));
+                    }
+                } else {
+                    return Err(LMStudioError::connection("Invalid authentication response format"));
+                }
+
+                self.logger.info(&format!("Successfully connected and authenticated to {} namespace", self.namespace));
+            }
+            Some(Ok(msg)) => {
+                return Err(LMStudioError::connection(format!("Unexpected auth response type: {:?}", msg)));
+            }
+            Some(Err(e)) => {
+                return Err(LMStudioError::connection(format!("Auth response error: {}", e)));
+            }
+            None => {
+                return Err(LMStudioError::connection("No authentication response received"));
+            }
+        }
 
         // Store the sender for outgoing messages
         self.ws_sender = Some(tx);
@@ -63,7 +120,6 @@ impl NamespaceConnection {
         *self.connected.write().await = true;
 
         // Spawn task to handle outgoing messages
-        let mut ws_sender = ws_sender;
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 if let Err(e) = ws_sender.send(message).await {
@@ -119,11 +175,11 @@ impl NamespaceConnection {
     /// Close the connection
     pub async fn close(&mut self) -> Result<()> {
         *self.connected.write().await = false;
-        
+
         if let Some(sender) = &self.ws_sender {
             let _ = sender.send(Message::Close(None));
         }
-        
+
         self.ws_sender = None;
         self.logger.info(&format!("Closed connection to namespace: {}", self.namespace));
         Ok(())
@@ -184,36 +240,43 @@ impl NamespaceConnection {
         _active_channels: &Arc<RwLock<HashMap<i32, Box<dyn ChannelHandler>>>>,
         logger: &Logger,
     ) -> Result<()> {
+        logger.debug(&format!("Received raw WebSocket message: {}", text));
+
         let message: WebSocketMessage = serde_json::from_str(text)?;
 
-        if let Some(id) = message.id {
-            // This is a response to a previous call
-            let sender = {
-                let mut calls = pending_calls.write().await;
-                calls.remove(&id)
-            };
+        // Check if this is an RPC response
+        if let (Some(message_type), Some(call_id)) = (&message.message_type, message.call_id) {
+            if message_type == "rpcResult" {
+                logger.debug(&format!("Received RPC response: {}", text));
 
-            if let Some(sender) = sender {
-                let response = if let Some(result) = message.result {
-                    result
-                } else if let Some(error) = message.error {
-                    return Err(LMStudioError::remote_call_failed(format!("Remote call failed: {}", error)));
-                } else {
-                    Value::Null
+                // This is a response to a previous call
+                let sender = {
+                    let mut calls = pending_calls.write().await;
+                    calls.remove(&call_id)
                 };
 
-                if let Err(_) = sender.send(response) {
-                    logger.debug(&format!("Failed to send response for call ID {}", id));
-                }
+                if let Some(sender) = sender {
+                    let response = if let Some(result) = message.result {
+                        result
+                    } else if let Some(error) = message.error {
+                        return Err(LMStudioError::remote_call_failed(format!("Remote call failed: {}", error)));
+                    } else {
+                        Value::Null
+                    };
 
-                // Remove from unload calls tracking
-                pending_unload_calls.write().await.remove(&id);
+                    if let Err(_) = sender.send(response) {
+                        logger.debug(&format!("Failed to send response for call ID {}", call_id));
+                    }
+
+                    // Remove from unload calls tracking
+                    pending_unload_calls.write().await.remove(&call_id);
+                }
+                return Ok(());
             }
-        } else {
-            // This might be a channel message or notification
-            logger.debug(&format!("Received notification: {}", text));
         }
 
+        // This might be a channel message or notification
+        logger.debug(&format!("Received notification: {}", text));
         Ok(())
     }
 
@@ -248,7 +311,7 @@ impl NamespaceConnection {
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        
+
         // Register the pending call
         {
             let mut pending = self.pending_calls.write().await;
@@ -261,17 +324,18 @@ impl NamespaceConnection {
             unload_calls.insert(id, true);
         }
 
-        // Build and send the request
-        let request = WebSocketMessage {
-            id: Some(id),
-            method: Some(endpoint.to_string()),
+        // Build and send the request in Go-compatible format
+        let request = RpcCallMessage {
+            call_id: id,
+            endpoint: endpoint.to_string(),
+            message_type: "rpcCall".to_string(),
             params,
-            result: None,
-            error: None,
         };
 
         let request_text = serde_json::to_string(&request)?;
-        
+
+        self.logger.debug(&format!("Sending RPC call to {}: {}", self.namespace, request_text));
+
         if let Some(sender) = &self.ws_sender {
             sender.send(Message::Text(request_text))
                 .map_err(|_| LMStudioError::connection("Failed to send message"))?;
