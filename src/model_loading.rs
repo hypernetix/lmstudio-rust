@@ -25,7 +25,7 @@ impl ModelLoadingChannel {
         logger: Logger,
     ) -> (Self, mpsc::UnboundedSender<LoadingProgress>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        
+
         let channel = Self {
             channel_id,
             progress_receiver: rx,
@@ -51,7 +51,7 @@ impl ModelLoadingChannel {
         let result = timeout(timeout_duration, async {
             while let Some(progress) = self.next_progress().await {
                 self.logger.debug(&format!("Loading progress: {:.1}%", progress.progress * 100.0));
-                
+
                 if progress.progress >= 1.0 {
                     return Ok(());
                 }
@@ -198,7 +198,7 @@ mod tests {
     fn test_loading_params_minimal() {
         let params = LoadingParams::new("test-model");
         let json = params.to_json();
-        
+
         assert_eq!(json["modelIdentifier"], "test-model");
         assert!(json.get("gpuOffload").is_none());
         assert!(json.get("contextLength").is_none());
