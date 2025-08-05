@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 /// Channel handler trait for different types of message handlers
 pub trait ChannelHandler: Send + Sync {
-    fn handle_message(&self, message: &[u8]) -> Result<()>;
+    fn handle_message(&self, message: &serde_json::Value);
 }
 
 /// Namespace connection manages WebSocket connection to a specific LM Studio namespace
@@ -237,12 +237,13 @@ impl NamespaceConnection {
         text: &str,
         pending_calls: &Arc<RwLock<HashMap<i32, mpsc::UnboundedSender<Value>>>>,
         pending_unload_calls: &Arc<RwLock<HashMap<i32, bool>>>,
-        _active_channels: &Arc<RwLock<HashMap<i32, Box<dyn ChannelHandler>>>>,
+        active_channels: &Arc<RwLock<HashMap<i32, Box<dyn ChannelHandler>>>>,
         logger: &Logger,
     ) -> Result<()> {
         logger.debug(&format!("Received raw WebSocket message: {}", text));
 
         let message: WebSocketMessage = serde_json::from_str(text)?;
+        let raw_value: Value = serde_json::from_str(text)?;
 
         // Check if this is an RPC response
         if let (Some(message_type), Some(call_id)) = (&message.message_type, message.call_id) {
@@ -275,7 +276,26 @@ impl NamespaceConnection {
             }
         }
 
-        // This might be a channel message or notification
+        // Check if this is a channel message
+        if let Some(msg_type) = raw_value.get("type").and_then(|t| t.as_str()) {
+            if msg_type == "channelSend" || msg_type == "channelClose" || msg_type == "channelError" {
+                if let Some(channel_id) = raw_value.get("channelId").and_then(|id| id.as_i64()) {
+                    let channel_id = channel_id as i32;
+                    logger.debug(&format!("Routing {} message to channel {}", msg_type, channel_id));
+                    
+                    // Route to the appropriate channel handler
+                    let channels = active_channels.read().await;
+                    if let Some(handler) = channels.get(&channel_id) {
+                        handler.handle_message(&raw_value);
+                    } else {
+                        logger.debug(&format!("No handler registered for channel {}", channel_id));
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // This might be a notification
         logger.debug(&format!("Received notification: {}", text));
         Ok(())
     }
@@ -361,5 +381,22 @@ impl NamespaceConnection {
     pub async fn unregister_channel_handler(&self, channel_id: i32) {
         let mut channels = self.active_channels.write().await;
         channels.remove(&channel_id);
+    }
+
+    /// Send a raw JSON message directly to the WebSocket
+    pub async fn send_raw_message(&self, message: Value) -> Result<()> {
+        self.ensure_connected().await?;
+
+        let message_text = serde_json::to_string(&message)?;
+        self.logger.debug(&format!("Sending raw message to {}: {}", self.namespace, message_text));
+
+        if let Some(sender) = &self.ws_sender {
+            sender.send(Message::Text(message_text))
+                .map_err(|_| LMStudioError::connection("Failed to send raw message"))?;
+        } else {
+            return Err(LMStudioError::connection("WebSocket sender not available"));
+        }
+
+        Ok(())
     }
 }

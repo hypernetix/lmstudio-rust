@@ -1,11 +1,11 @@
 //! Main LM Studio client implementation
 
-use crate::connection::NamespaceConnection;
+use crate::connection::{ChannelHandler, NamespaceConnection};
 use crate::discovery::Discovery;
 use crate::error::{LMStudioError, Result};
 use crate::logger::Logger;
 use crate::model_loading::{LoadingParams, ModelLoadingChannel, ModelLoadingHandler};
-use crate::types::{ChatMessage, Model};
+use crate::types::Model;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +13,67 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use rand::Rng;
+
+/// Streaming channel handler for processing chat responses
+struct StreamingChannelHandler {
+    token_sender: tokio::sync::mpsc::UnboundedSender<String>,
+    done_sender: tokio::sync::mpsc::UnboundedSender<()>,
+    logger: Logger,
+}
+
+impl ChannelHandler for StreamingChannelHandler {
+    fn handle_message(&self, message: &serde_json::Value) {
+        self.logger.debug(&format!("StreamingChannelHandler received message: {}", message));
+
+        // Handle channelSend messages
+        if let Some(msg_type) = message.get("type").and_then(|t| t.as_str()) {
+            match msg_type {
+                "channelSend" => {
+                    if let Some(message_content) = message.get("message").and_then(|m| m.as_object()) {
+                        if let Some(content_type) = message_content.get("type").and_then(|t| t.as_str()) {
+                            match content_type {
+                                "fragment" => {
+                                    // Extract token from fragment
+                                    if let Some(fragment_obj) = message_content.get("fragment").and_then(|f| f.as_object()) {
+                                        if let Some(content) = fragment_obj.get("content").and_then(|c| c.as_str()) {
+                                            if !content.is_empty() {
+                                                self.logger.debug(&format!("Extracted fragment content: {}", content));
+                                                let _ = self.token_sender.send(content.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                "success" => {
+                                    // Chat completed successfully
+                                    self.logger.debug("Chat completed successfully");
+                                    let _ = self.done_sender.send(());
+                                }
+                                "promptProcessingProgress" => {
+                                    // Progress update, can be ignored for now
+                                    self.logger.debug("Prompt processing progress update");
+                                }
+                                _ => {
+                                    self.logger.debug(&format!("Unknown message content type: {}", content_type));
+                                }
+                            }
+                        }
+                    }
+                }
+                "channelClose" => {
+                    self.logger.debug("Channel closed");
+                    let _ = self.done_sender.send(());
+                }
+                "channelError" => {
+                    self.logger.error(&format!("Channel error: {}", message));
+                    let _ = self.done_sender.send(());
+                }
+                _ => {
+                    self.logger.debug(&format!("Unknown message type: {}", msg_type));
+                }
+            }
+        }
+    }
+}
 
 /// Main LM Studio client for interacting with LM Studio service
 #[derive(Clone)]
@@ -50,39 +111,39 @@ impl LMStudioClient {
     /// Get or create a connection to a specific namespace
     async fn get_connection(&self, namespace: &str) -> Result<Arc<RwLock<NamespaceConnection>>> {
         let connections = self.connections.read().await;
-        
+
         if let Some(conn) = connections.get(namespace) {
             let conn_guard = conn.read().await;
             if conn_guard.is_connected().await {
                 return Ok(Arc::clone(conn));
             }
         }
-        
+
         drop(connections);
 
         // Create a new connection
         let mut new_conn = NamespaceConnection::new(namespace.to_string(), self.logger.clone());
         new_conn.connect(&self.api_host).await?;
-        
+
         let conn_arc = Arc::new(RwLock::new(new_conn));
-        
+
         let mut connections = self.connections.write().await;
         connections.insert(namespace.to_string(), Arc::clone(&conn_arc));
-        
+
         Ok(conn_arc)
     }
 
     /// Close all namespace connections
     pub async fn close(&self) -> Result<()> {
         let mut connections = self.connections.write().await;
-        
+
         for (namespace, conn) in connections.drain() {
             let mut conn_guard = conn.write().await;
             if let Err(e) = conn_guard.close().await {
                 self.logger.warn(&format!("Error closing connection to {}: {}", namespace, e));
             }
         }
-        
+
         self.logger.info("All connections closed");
         Ok(())
     }
@@ -91,11 +152,11 @@ impl LMStudioClient {
     pub async fn list_loaded_llms(&self) -> Result<Vec<Model>> {
         let conn = self.get_connection("llm").await?;
         let conn_guard = conn.read().await;
-        
+
         let response = conn_guard.remote_call("listLoaded", None).await?;
         let models: Vec<Model> = serde_json::from_value(response)
             .map_err(|e| LMStudioError::invalid_response(format!("Failed to parse models: {}", e)))?;
-        
+
         Ok(models)
     }
 
@@ -103,11 +164,11 @@ impl LMStudioClient {
     pub async fn list_downloaded_models(&self) -> Result<Vec<Model>> {
         let conn = self.get_connection("llm").await?;
         let conn_guard = conn.read().await;
-        
+
         let response = conn_guard.remote_call("listDownloaded", None).await?;
         let models: Vec<Model> = serde_json::from_value(response)
             .map_err(|e| LMStudioError::invalid_response(format!("Failed to parse models: {}", e)))?;
-        
+
         Ok(models)
     }
 
@@ -115,30 +176,30 @@ impl LMStudioClient {
     pub async fn list_loaded_embedding_models(&self) -> Result<Vec<Model>> {
         let conn = self.get_connection("embedding").await?;
         let conn_guard = conn.read().await;
-        
+
         let response = conn_guard.remote_call("listLoaded", None).await?;
         let models: Vec<Model> = serde_json::from_value(response)
             .map_err(|e| LMStudioError::invalid_response(format!("Failed to parse models: {}", e)))?;
-        
+
         Ok(models)
     }
 
     /// List all loaded models (both LLM and embedding)
     pub async fn list_all_loaded_models(&self) -> Result<Vec<Model>> {
         let mut all_models = Vec::new();
-        
+
         // Get LLM models
         match self.list_loaded_llms().await {
             Ok(mut models) => all_models.append(&mut models),
             Err(e) => self.logger.warn(&format!("Failed to get LLM models: {}", e)),
         }
-        
+
         // Get embedding models
         match self.list_loaded_embedding_models().await {
             Ok(mut models) => all_models.append(&mut models),
             Err(e) => self.logger.warn(&format!("Failed to get embedding models: {}", e)),
         }
-        
+
         Ok(all_models)
     }
 
@@ -153,38 +214,38 @@ impl LMStudioClient {
         namespace: &str,
     ) -> Result<ModelLoadingChannel> {
         let conn = self.get_connection(namespace).await?;
-        
+
         // Generate a unique channel ID
         let channel_id = rand::thread_rng().gen::<i32>().abs();
-        
+
         let (channel, progress_sender) = ModelLoadingChannel::new(
             channel_id,
             Arc::clone(&conn),
             self.logger.clone(),
         );
-        
+
         // Register the channel handler
         let handler = Box::new(ModelLoadingHandler::new(progress_sender, self.logger.clone()));
         let conn_guard = conn.read().await;
         conn_guard.register_channel_handler(channel_id, handler).await;
-        
+
         Ok(channel)
     }
 
     /// Check if a model exists in downloaded models
     async fn check_model_exists(&self, model_identifier: &str) -> Result<()> {
         let models = self.list_downloaded_models().await?;
-        
+
         let exists = models.iter().any(|model| {
-            model.model_key == model_identifier || 
+            model.model_key == model_identifier ||
             model.identifier.as_ref() == Some(&model_identifier.to_string()) ||
             model.path.contains(model_identifier)
         });
-        
+
         if !exists {
             return Err(LMStudioError::model_not_found(model_identifier));
         }
-        
+
         Ok(())
     }
 
@@ -192,7 +253,7 @@ impl LMStudioClient {
     async fn is_model_already_loaded(&self, model_identifier: &str) -> bool {
         match self.list_loaded_llms().await {
             Ok(models) => models.iter().any(|model| {
-                model.model_key == model_identifier || 
+                model.model_key == model_identifier ||
                 model.identifier.as_ref() == Some(&model_identifier.to_string())
             }),
             Err(_) => false,
@@ -233,7 +294,7 @@ impl LMStudioClient {
     {
         // Check if model exists
         self.check_model_exists(model_identifier).await?;
-        
+
         // Check if already loaded
         if self.is_model_already_loaded(model_identifier).await {
             return Err(LMStudioError::ModelAlreadyLoaded(model_identifier.to_string()));
@@ -241,35 +302,35 @@ impl LMStudioClient {
 
         // Create loading channel
         let mut channel = self.new_model_loading_channel("llm").await?;
-        
+
         // Start loading
         let conn = self.get_connection("llm").await?;
         let conn_guard = conn.read().await;
-        
+
         let _params = LoadingParams::new(model_identifier);
         let load_params = json!({
             "modelIdentifier": model_identifier,
             "channelId": channel.channel_id()
         });
-        
+
         conn_guard.remote_call("load", Some(load_params)).await?;
-        
+
         // Wait for completion with progress updates
         let result = timeout(load_timeout, async {
             while let Some(progress) = channel.next_progress().await {
                 if let Some(ref callback) = progress_callback {
                     callback(progress.progress, progress.model_info.as_ref());
                 }
-                
+
                 if progress.progress >= 1.0 {
                     break;
                 }
             }
         }).await;
-        
+
         // Clean up channel
         let _ = channel.close().await;
-        
+
         match result {
             Ok(_) => {
                 self.logger.info(&format!("Successfully loaded model: {}", model_identifier));
@@ -285,21 +346,21 @@ impl LMStudioClient {
     pub async fn unload_model(&self, model_identifier: &str) -> Result<()> {
         let conn = self.get_connection("llm").await?;
         let conn_guard = conn.read().await;
-        
+
         let params = json!({
             "modelIdentifier": model_identifier
         });
-        
+
         conn_guard.remote_call("unload", Some(params)).await?;
         self.logger.info(&format!("Successfully unloaded model: {}", model_identifier));
-        
+
         Ok(())
     }
 
     /// Unload all currently loaded models
     pub async fn unload_all_models(&self) -> Result<()> {
         let models = self.list_loaded_llms().await?;
-        
+
         for model in models {
             if let Some(identifier) = &model.identifier {
                 if let Err(e) = self.unload_model(identifier).await {
@@ -307,7 +368,7 @@ impl LMStudioClient {
                 }
             }
         }
-        
+
         self.logger.info("Finished unloading all models");
         Ok(())
     }
@@ -321,28 +382,88 @@ impl LMStudioClient {
         callback: F,
     ) -> Result<()>
     where
-        F: Fn(&str) + Send + Sync,
+        F: Fn(&str) + Send + Sync + 'static,
     {
+        // First, get the loaded models to find the instance reference
+        let loaded_models = self.list_loaded_llms().await?;
+        let model = loaded_models.iter()
+            .find(|m| m.identifier.as_ref().unwrap_or(&m.model_key) == model_identifier || m.model_key == model_identifier)
+            .ok_or_else(|| LMStudioError::ModelNotFound(model_identifier.to_string()))?;
+
+        let instance_reference = model.instance_reference.as_ref()
+            .ok_or_else(|| LMStudioError::InvalidResponse("Model missing instance reference".to_string()))?;
+
         let conn = self.get_connection("llm").await?;
         let conn_guard = conn.read().await;
-        
-        let messages = vec![ChatMessage::user(prompt)];
-        
-        let params = json!({
-            "modelIdentifier": model_identifier,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": true
+
+        // Generate a random channel ID
+        use rand::Rng;
+        let chat_channel_id = rand::thread_rng().gen_range(1..100000);
+
+        // Create the channelCreate message matching the Go implementation
+        let channel_create_msg = json!({
+            "type": "channelCreate",
+            "channelId": chat_channel_id,
+            "endpoint": "predict",
+            "creationParameter": {
+                "modelSpecifier": {
+                    "type": "instanceReference",
+                    "instanceReference": instance_reference
+                },
+                "history": {
+                    "messages": [{
+                        "role": "user",
+                        "content": [{
+                            "type": "text",
+                            "text": prompt
+                        }]
+                    }]
+                },
+                "predictionConfigStack": {
+                    "layers": [{
+                        "layerName": "instance",
+                        "config": {
+                            "temperature": temperature,
+                            "maxTokens": 4096,
+                            "stream": true,
+                            "fields": []
+                        }
+                    }]
+                }
+            }
         });
-        
-        // TODO: Implement streaming response handling
-        // This is a placeholder - the actual implementation would need
-        // to handle streaming WebSocket messages
-        let _response = conn_guard.remote_call("chat", Some(params)).await?;
-        
-        // For now, just call the callback once with a placeholder
-        callback("Streaming response handling not yet implemented");
-        
+
+        // Send the channelCreate message directly to the WebSocket
+        self.logger.debug(&format!("Sending channelCreate message for prompt to model: {}", model_identifier));
+        conn_guard.send_raw_message(channel_create_msg).await?;
+
+        // Create a channel to receive streaming tokens
+        let (token_tx, mut token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        // Register a streaming handler for this channel
+        let streaming_handler = StreamingChannelHandler {
+            token_sender: token_tx,
+            done_sender: done_tx,
+            logger: self.logger.clone(),
+        };
+
+        conn_guard.register_channel_handler(chat_channel_id, Box::new(streaming_handler)).await;
+
+        // Process streaming tokens in a separate task
+        let _process_task = tokio::spawn(async move {
+            while let Some(token) = token_rx.recv().await {
+                callback(&token);
+            }
+        });
+
+        // Wait for completion signal
+        let _ = done_rx.recv().await;
+
+        // Clean up the channel handler
+        conn_guard.unregister_channel_handler(chat_channel_id).await;
+
+        // The process_task will complete when token_rx is closed by the handler
         Ok(())
     }
 }
@@ -363,7 +484,7 @@ mod tests {
     async fn test_client_creation() {
         let logger = Logger::new(LogLevel::Debug);
         let result = LMStudioClient::new(Some("http://localhost:1234"), Some(logger)).await;
-        
+
         // This should not panic even if LM Studio is not running
         assert!(result.is_ok());
     }

@@ -94,12 +94,9 @@ impl ModelLoadingHandler {
 }
 
 impl ChannelHandler for ModelLoadingHandler {
-    fn handle_message(&self, message: &[u8]) -> Result<()> {
-        // Parse the message as JSON
-        let text = std::str::from_utf8(message)
-            .map_err(|e| LMStudioError::other(format!("Invalid UTF-8 in message: {}", e)))?;
-
-        let json: Value = serde_json::from_str(text)?;
+    fn handle_message(&self, message: &serde_json::Value) {
+        // Message is already parsed as JSON
+        let json = message;
 
         // Extract progress information
         let progress = json.get("progress")
@@ -118,8 +115,6 @@ impl ChannelHandler for ModelLoadingHandler {
         if let Err(_) = self.progress_sender.send(loading_progress) {
             self.logger.debug("Progress receiver dropped");
         }
-
-        Ok(())
     }
 }
 

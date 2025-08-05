@@ -61,7 +61,7 @@ cargo build --release
 
 Some features are still being implemented:
 
-- [ ] Complete streaming chat implementation
+- [v] Complete streaming chat implementation
 - [ ] Binary message handling for channels
 - [ ] Advanced model loading configurations
 - [ ] Embedding model operations
