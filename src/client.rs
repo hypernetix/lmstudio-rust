@@ -4,7 +4,7 @@ use crate::connection::{ChannelHandler, NamespaceConnection};
 use crate::discovery::Discovery;
 use crate::error::{LMStudioError, Result};
 use crate::logger::Logger;
-use crate::model_loading::{LoadingParams, ModelLoadingChannel, ModelLoadingHandler};
+use crate::model_loading::{ModelLoadingChannel, ModelLoadingHandler};
 use crate::types::Model;
 use serde_json::json;
 use std::collections::HashMap;
@@ -162,10 +162,10 @@ impl LMStudioClient {
 
     /// List all downloaded models
     pub async fn list_downloaded_models(&self) -> Result<Vec<Model>> {
-        let conn = self.get_connection("llm").await?;
+        let conn = self.get_connection("system").await?;
         let conn_guard = conn.read().await;
 
-        let response = conn_guard.remote_call("listDownloaded", None).await?;
+        let response = conn_guard.remote_call("listDownloadedModels", None).await?;
         let models: Vec<Model> = serde_json::from_value(response)
             .map_err(|e| LMStudioError::invalid_response(format!("Failed to parse models: {}", e)))?;
 
@@ -215,8 +215,8 @@ impl LMStudioClient {
     ) -> Result<ModelLoadingChannel> {
         let conn = self.get_connection(namespace).await?;
 
-        // Generate a unique channel ID
-        let channel_id = rand::thread_rng().gen::<i32>().abs();
+        // Generate a unique channel ID (match Go implementation: 1-100000)
+        let channel_id = rand::thread_rng().gen_range(1..=100000);
 
         let (channel, progress_sender) = ModelLoadingChannel::new(
             channel_id,
@@ -303,17 +303,24 @@ impl LMStudioClient {
         // Create loading channel
         let mut channel = self.new_model_loading_channel("llm").await?;
 
-        // Start loading
+        // Start loading using channelCreate with loadModel endpoint
         let conn = self.get_connection("llm").await?;
         let conn_guard = conn.read().await;
 
-        let _params = LoadingParams::new(model_identifier);
-        let load_params = json!({
-            "modelIdentifier": model_identifier,
-            "channelId": channel.channel_id()
+        let channel_create_msg = json!({
+            "type": "channelCreate",
+            "channelId": channel.channel_id(),
+            "endpoint": "loadModel",
+            "creationParameter": {
+                "modelKey": model_identifier,
+                "identifier": model_identifier,
+                "loadConfigStack": {
+                    "layers": []
+                }
+            }
         });
 
-        conn_guard.remote_call("load", Some(load_params)).await?;
+        conn_guard.send_raw_message(channel_create_msg).await?;
 
         // Wait for completion with progress updates
         let result = timeout(load_timeout, async {

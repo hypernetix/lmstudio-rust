@@ -95,25 +95,87 @@ impl ModelLoadingHandler {
 
 impl ChannelHandler for ModelLoadingHandler {
     fn handle_message(&self, message: &serde_json::Value) {
-        // Message is already parsed as JSON
-        let json = message;
+        self.logger.debug(&format!("ModelLoadingHandler received message: {}", message));
 
-        // Extract progress information
-        let progress = json.get("progress")
-            .and_then(|p| p.as_f64())
-            .unwrap_or(0.0);
-
-        let model_info = json.get("modelInfo")
-            .and_then(|info| serde_json::from_value::<Model>(info.clone()).ok());
-
-        let loading_progress = LoadingProgress {
-            progress,
-            model_info,
-        };
-
-        // Send progress update
-        if let Err(_) = self.progress_sender.send(loading_progress) {
-            self.logger.debug("Progress receiver dropped");
+        // Handle channelSend messages
+        if let Some(msg_type) = message.get("type").and_then(|t| t.as_str()) {
+            match msg_type {
+                "channelSend" => {
+                    if let Some(inner_message) = message.get("message").and_then(|m| m.as_object()) {
+                        if let Some(content_type) = inner_message.get("type").and_then(|t| t.as_str()) {
+                            match content_type {
+                                "resolved" => {
+                                    // Model info resolved
+                                    self.logger.debug("Model resolved");
+                                    if let Some(model_info) = inner_message.get("info") {
+                                        if let Ok(model) = serde_json::from_value::<Model>(model_info.clone()) {
+                                            let loading_progress = LoadingProgress {
+                                                progress: 0.0,
+                                                model_info: Some(model),
+                                            };
+                                            let _ = self.progress_sender.send(loading_progress);
+                                        }
+                                    }
+                                }
+                                "progress" => {
+                                    // Progress update
+                                    if let Some(progress) = inner_message.get("progress").and_then(|p| p.as_f64()) {
+                                        self.logger.debug(&format!("Progress update: {:.1}%", progress * 100.0));
+                                        let loading_progress = LoadingProgress {
+                                            progress,
+                                            model_info: None,
+                                        };
+                                        let _ = self.progress_sender.send(loading_progress);
+                                    }
+                                }
+                                "success" => {
+                                    // Loading completed successfully
+                                    self.logger.debug("Model loading completed successfully");
+                                    let loading_progress = LoadingProgress {
+                                        progress: 1.0,
+                                        model_info: None,
+                                    };
+                                    let _ = self.progress_sender.send(loading_progress);
+                                }
+                                "error" => {
+                                    // Loading failed
+                                    self.logger.error(&format!("Model loading failed: {:?}", inner_message));
+                                    // Still send progress to unblock waiting code
+                                    let loading_progress = LoadingProgress {
+                                        progress: 1.0, // Mark as complete to stop waiting
+                                        model_info: None,
+                                    };
+                                    let _ = self.progress_sender.send(loading_progress);
+                                }
+                                _ => {
+                                    self.logger.debug(&format!("Unknown message content type: {}", content_type));
+                                }
+                            }
+                        }
+                    }
+                }
+                "channelClose" => {
+                    self.logger.debug("Model loading channel closed");
+                    // Send final progress to unblock waiting code
+                    let loading_progress = LoadingProgress {
+                        progress: 1.0,
+                        model_info: None,
+                    };
+                    let _ = self.progress_sender.send(loading_progress);
+                }
+                "channelError" => {
+                    self.logger.error(&format!("Model loading channel error: {}", message));
+                    // Send final progress to unblock waiting code
+                    let loading_progress = LoadingProgress {
+                        progress: 1.0,
+                        model_info: None,
+                    };
+                    let _ = self.progress_sender.send(loading_progress);
+                }
+                _ => {
+                    self.logger.debug(&format!("Unknown message type: {}", msg_type));
+                }
+            }
         }
     }
 }
