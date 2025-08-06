@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use rand::Rng;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Streaming channel handler for processing chat responses
 struct StreamingChannelHandler {
@@ -208,26 +209,29 @@ impl LMStudioClient {
         Ok(self.discovery.check_instance(&self.api_host).await)
     }
 
+    /// Generate next channel ID (similar to Go implementation)
+    fn next_channel_id(&self) -> i32 {
+        rand::thread_rng().gen_range(1..=100000)
+    }
+
     /// Create a new model loading channel
-    pub async fn new_model_loading_channel(
-        &self,
-        namespace: &str,
-    ) -> Result<ModelLoadingChannel> {
+    async fn new_model_loading_channel(&self, namespace: &str, model_key: &str) -> Result<ModelLoadingChannel> {
         let conn = self.get_connection(namespace).await?;
+        let channel_id = self.next_channel_id();
 
-        // Generate a unique channel ID (match Go implementation: 1-100000)
-        let channel_id = rand::thread_rng().gen_range(1..=100000);
-
-        let (channel, progress_sender) = ModelLoadingChannel::new(
+        let (channel, sender) = ModelLoadingChannel::new(
             channel_id,
-            Arc::clone(&conn),
-            self.logger.clone(),
+            model_key.to_string(),
+            conn.clone(),
+            self.logger.clone()
         );
 
-        // Register the channel handler
-        let handler = Box::new(ModelLoadingHandler::new(progress_sender, self.logger.clone()));
-        let conn_guard = conn.read().await;
-        conn_guard.register_channel_handler(channel_id, handler).await;
+        let handler = ModelLoadingHandler::new(sender, self.logger.clone());
+
+        {
+            let conn_guard = conn.read().await;
+            conn_guard.register_channel_handler(channel_id, Box::new(handler)).await;
+        }
 
         Ok(channel)
     }
@@ -301,7 +305,7 @@ impl LMStudioClient {
         }
 
         // Create loading channel
-        let mut channel = self.new_model_loading_channel("llm").await?;
+        let mut channel = self.new_model_loading_channel("llm", model_identifier).await?;
 
         // Start loading using channelCreate with loadModel endpoint
         let conn = self.get_connection("llm").await?;
@@ -322,18 +326,27 @@ impl LMStudioClient {
 
         conn_guard.send_raw_message(channel_create_msg).await?;
 
-        // Wait for completion with progress updates
-        let result = timeout(load_timeout, async {
-            while let Some(progress) = channel.next_progress().await {
-                if let Some(ref callback) = progress_callback {
-                    callback(progress.progress, progress.model_info.as_ref());
-                }
+        // Wait for completion with progress updates and cancellation support
+        let cancellation_token = channel.cancellation_token();
+        let result = tokio::select! {
+            result = async {
+                timeout(load_timeout, async {
+                    while let Some(progress) = channel.next_progress().await {
+                        if let Some(ref callback) = progress_callback {
+                            callback(progress.progress, progress.model_info.as_ref());
+                        }
 
-                if progress.progress >= 1.0 {
-                    break;
-                }
+                        if progress.progress >= 1.0 {
+                            break;
+                        }
+                    }
+                }).await
+            } => result,
+            _ = cancellation_token.cancelled() => {
+                self.logger.debug("Model loading cancelled by user");
+                return Err(LMStudioError::other("Model loading cancelled by user"));
             }
-        }).await;
+        };
 
         // Clean up channel
         let _ = channel.close().await;
@@ -343,6 +356,92 @@ impl LMStudioClient {
                 self.logger.info(&format!("Successfully loaded model: {}", model_identifier));
                 Ok(())
             }
+            Err(_) => Err(LMStudioError::LoadingTimeout(format!(
+                "Model loading timeout after {:?}: {}", load_timeout, model_identifier
+            ))),
+        }
+    }
+
+    /// Load a model with progress reporting, timeout, and external cancellation support
+    pub async fn load_model_with_progress_and_cancellation<F>(
+        &self,
+        load_timeout: Duration,
+        model_identifier: &str,
+        progress_callback: Option<F>,
+        cancellation_signal: Arc<AtomicBool>,
+    ) -> Result<()>
+    where
+        F: Fn(f64, Option<&Model>) + Send + Sync,
+    {
+        // Check if model exists
+        self.check_model_exists(model_identifier).await?;
+
+        // Check if already loaded
+        if self.is_model_already_loaded(model_identifier).await {
+            return Err(LMStudioError::ModelAlreadyLoaded(model_identifier.to_string()));
+        }
+
+        // Create loading channel
+        let mut channel = self.new_model_loading_channel("llm", model_identifier).await?;
+
+        // Start loading using channelCreate with loadModel endpoint
+        let conn = self.get_connection("llm").await?;
+        let conn_guard = conn.read().await;
+
+        let channel_create_msg = json!({
+            "type": "channelCreate",
+            "channelId": channel.channel_id(),
+            "endpoint": "loadModel",
+            "creationParameter": {
+                "modelKey": model_identifier,
+                "identifier": model_identifier,
+                "loadConfigStack": {
+                    "layers": []
+                }
+            }
+        });
+
+        conn_guard.send_raw_message(channel_create_msg).await?;
+
+        // Wait for completion with progress updates and external cancellation support
+        let cancellation_token = channel.cancellation_token();
+        let result = tokio::select! {
+            result = async {
+                timeout(load_timeout, async {
+                    while let Some(progress) = channel.next_progress().await {
+                        // Check for external cancellation signal
+                        if cancellation_signal.load(Ordering::SeqCst) {
+                            self.logger.debug("External cancellation signal received");
+                            let _ = channel.cancel().await;
+                            return Err(LMStudioError::other("Model loading cancelled by user"));
+                        }
+
+                        if let Some(ref callback) = progress_callback {
+                            callback(progress.progress, progress.model_info.as_ref());
+                        }
+
+                        if progress.progress >= 1.0 {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }).await
+            } => result,
+            _ = cancellation_token.cancelled() => {
+                self.logger.debug("Model loading cancelled by internal token");
+                return Err(LMStudioError::other("Model loading cancelled"));
+            }
+        };
+
+        // Clean up channel
+        let _ = channel.close().await;
+
+        match result {
+            Ok(Ok(_)) => {
+                self.logger.info(&format!("Successfully loaded model: {}", model_identifier));
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(LMStudioError::LoadingTimeout(format!(
                 "Model loading timeout after {:?}: {}", load_timeout, model_identifier
             ))),

@@ -8,12 +8,15 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{timeout, Duration};
+use tokio_util::sync::CancellationToken;
 
 /// Model loading channel for tracking loading progress
 pub struct ModelLoadingChannel {
     channel_id: i32,
+    model_key: String,
     progress_receiver: mpsc::UnboundedReceiver<LoadingProgress>,
     connection: Arc<RwLock<NamespaceConnection>>,
+    cancellation_token: CancellationToken,
     logger: Logger,
 }
 
@@ -21,6 +24,7 @@ impl ModelLoadingChannel {
     /// Create a new model loading channel
     pub fn new(
         channel_id: i32,
+        model_key: String,
         connection: Arc<RwLock<NamespaceConnection>>,
         logger: Logger,
     ) -> (Self, mpsc::UnboundedSender<LoadingProgress>) {
@@ -28,8 +32,10 @@ impl ModelLoadingChannel {
 
         let channel = Self {
             channel_id,
+            model_key,
             progress_receiver: rx,
             connection,
+            cancellation_token: CancellationToken::new(),
             logger,
         };
 
@@ -41,12 +47,108 @@ impl ModelLoadingChannel {
         self.channel_id
     }
 
-    /// Wait for the next progress update
-    pub async fn next_progress(&mut self) -> Option<LoadingProgress> {
-        self.progress_receiver.recv().await
+    /// Get the cancellation token
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
     }
 
-    /// Wait for loading to complete with timeout
+    /// Cancel the model loading with comprehensive cleanup (matches Go implementation)
+    pub async fn cancel(&self) -> Result<()> {
+        self.logger.debug(&format!("Attempting to cancel model loading for channel {} (model: {})", self.channel_id, self.model_key));
+
+        let conn = self.connection.read().await;
+
+        // Method 1: Try to unload the model that's being loaded to force-stop the loading process
+        // This is more aggressive than just closing the channel and ensures proper cancellation
+        let unload_call_id = self.channel_id + 10000; // Use a unique call ID
+        let unload_msg = serde_json::json!({
+            "type": "rpcCall",
+            "callId": unload_call_id,
+            "endpoint": "unloadModel",
+            "parameter": {
+                "identifier": self.model_key
+            }
+        });
+
+        self.logger.debug(&format!("Sending unload request to force-stop loading for model: {} (call ID: {})", self.model_key, unload_call_id));
+
+        // Send the unload request (best effort, don't wait for response)
+        if let Err(e) = conn.send_raw_message(unload_msg).await {
+            self.logger.debug(&format!("Failed to send unload request for model {}: {}", self.model_key, e));
+            // If we can't send the unload request, skip the other messages too
+            self.cleanup_channel().await;
+            return Ok(());
+        } else {
+            self.logger.debug(&format!("Sent unload request for model {}", self.model_key));
+        }
+
+        // Small delay to allow the unload request to be processed
+        self.logger.debug("Waiting 100ms for unload request to be processed...");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Method 2: Send channel abort message as a fallback
+        let abort_msg = serde_json::json!({
+            "type": "channelAbort",
+            "channelId": self.channel_id,
+            "reason": "user_cancelled"
+        });
+
+        self.logger.debug(&format!("Sending channel abort for channel {} as fallback", self.channel_id));
+        if let Err(e) = conn.send_raw_message(abort_msg).await {
+            self.logger.debug(&format!("Failed to send channel abort message for channel {}: {}", self.channel_id, e));
+        } else {
+            self.logger.debug(&format!("Sent channel abort message for channel {}", self.channel_id));
+        }
+
+        // Brief delay between messages
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Method 3: Send standard channel close message to cleanup the channel
+        let close_msg = serde_json::json!({
+            "type": "channelClose",
+            "channelId": self.channel_id
+        });
+
+        self.logger.debug(&format!("Sending channel close for channel {}", self.channel_id));
+
+        // Send the close message
+        if let Err(e) = conn.send_raw_message(close_msg).await {
+            self.logger.debug(&format!("Failed to send channel close message for channel {}: {}", self.channel_id, e));
+        } else {
+            self.logger.debug(&format!("Sent channel close message for channel {}", self.channel_id));
+        }
+
+        // Additional delay to ensure cancellation messages are sent before cleanup
+        self.logger.debug("Waiting additional 200ms for cancellation messages to be processed...");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Clean up the channel
+        self.cleanup_channel().await;
+
+        // Signal cancellation
+        self.cancellation_token.cancel();
+
+        Ok(())
+    }
+
+    /// Clean up the channel without sending messages
+    async fn cleanup_channel(&self) {
+        let conn = self.connection.read().await;
+        conn.unregister_channel_handler(self.channel_id).await;
+    }
+
+    /// Wait for the next progress update
+    pub async fn next_progress(&mut self) -> Option<LoadingProgress> {
+        tokio::select! {
+            progress = self.progress_receiver.recv() => progress,
+            _ = self.cancellation_token.cancelled() => {
+                self.logger.debug("Model loading cancelled");
+                None
+            }
+        }
+    }
+
+    /// Wait for loading to complete with timeout and cancellation support
     pub async fn wait_for_completion(&mut self, timeout_duration: Duration) -> Result<()> {
         let result = timeout(timeout_duration, async {
             while let Some(progress) = self.next_progress().await {
@@ -56,13 +158,23 @@ impl ModelLoadingChannel {
                     return Ok(());
                 }
             }
+
+            // Check if we were cancelled
+            if self.cancellation_token.is_cancelled() {
+                return Err(LMStudioError::other("Model loading was cancelled"));
+            }
+
             Err(LMStudioError::other("Progress channel closed unexpectedly"))
         }).await;
 
         match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(LMStudioError::LoadingTimeout("Model loading timeout".to_string())),
+            Err(_) => {
+                // Timeout occurred, attempt to cancel
+                let _ = self.cancel().await;
+                Err(LMStudioError::LoadingTimeout("Model loading timeout".to_string()))
+            }
         }
     }
 
