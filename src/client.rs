@@ -495,12 +495,14 @@ impl LMStudioClient {
         let conn = self.get_connection("llm").await?;
         let conn_guard = conn.read().await;
 
+        self.logger.debug(&format!("Sending unloadModel request for model: {}", model_identifier));
+
         let params = json!({
-            "modelIdentifier": model_identifier
+            "identifier": model_identifier
         });
 
-        conn_guard.remote_call("unload", Some(params)).await?;
-        self.logger.info(&format!("Successfully unloaded model: {}", model_identifier));
+        conn_guard.remote_call("unloadModel", Some(params)).await?;
+        self.logger.debug(&format!("Successfully unloaded model: {}", model_identifier));
 
         Ok(())
     }

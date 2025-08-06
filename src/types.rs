@@ -127,7 +127,7 @@ pub struct RpcCallMessage {
     #[serde(rename = "type")]
     pub message_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
+    pub parameter: Option<serde_json::Value>,
 }
 
 /// WebSocket message types used internally for RPC responses
@@ -181,7 +181,7 @@ pub fn format_size(size: i64) -> String {
     let mut div = UNIT;
     let mut exp = 0;
     let mut n = size / UNIT;
-    
+
     while n >= UNIT {
         div *= UNIT;
         exp += 1;

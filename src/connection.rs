@@ -282,7 +282,7 @@ impl NamespaceConnection {
                 if let Some(channel_id) = raw_value.get("channelId").and_then(|id| id.as_i64()) {
                     let channel_id = channel_id as i32;
                     logger.debug(&format!("Routing {} message to channel {}", msg_type, channel_id));
-                    
+
                     // Route to the appropriate channel handler
                     let channels = active_channels.read().await;
                     if let Some(handler) = channels.get(&channel_id) {
@@ -349,7 +349,7 @@ impl NamespaceConnection {
             call_id: id,
             endpoint: endpoint.to_string(),
             message_type: "rpcCall".to_string(),
-            params,
+            parameter: params,
         };
 
         let request_text = serde_json::to_string(&request)?;
