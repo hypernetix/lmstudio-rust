@@ -238,9 +238,9 @@ async fn load_model_with_progress(
     if let Err(ref e) = result {
         if e.to_string().contains("cancelled") {
             if let Some(pb) = &progress_bar {
-                pb.finish_with_message("⚠ Model loading cancelled by user");
+                pb.finish_with_message("Model loading cancelled");
             } else if !quiet {
-                println!("⚠ Model loading cancelled by user");
+                println!("Model loading cancelled");
             }
 
             // Wait for graceful cancellation with timeout (matching Go implementation)
@@ -259,7 +259,7 @@ async fn load_model_with_progress(
 
             if start_time.elapsed() >= graceful_timeout {
                 if !quiet {
-                    println!("Timeout waiting for loading cancellation after 5 seconds");
+                    println!("Timeout waiting for loading cancellation after 0.5 seconds");
                 }
             }
 
@@ -271,9 +271,9 @@ async fn load_model_with_progress(
 
     if let Some(pb) = progress_bar {
         if result.is_ok() {
-            pb.finish_with_message("✓ Model loaded successfully");
+            pb.finish_with_message("OK. Model loaded successfully");
         } else if !result.as_ref().unwrap_err().to_string().contains("cancelled") {
-            pb.finish_with_message("✗ Failed to load model");
+            pb.finish_with_message("Error, Failed to load model");
         }
     }
 

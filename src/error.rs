@@ -23,8 +23,8 @@ pub enum LMStudioError {
     #[error("Model not found: {0}")]
     ModelNotFound(String),
 
-    #[error("Model already loaded: {0}")]
-    ModelAlreadyLoaded(String),
+    #[error("Model loading cancelled: {0}")]
+    ModelLoadingCancelled(String),
 
     #[error("Model loading timeout: {0}")]
     LoadingTimeout(String),
@@ -63,6 +63,11 @@ impl LMStudioError {
     /// Create a new model not found error
     pub fn model_not_found<S: Into<String>>(model: S) -> Self {
         Self::ModelNotFound(model.into())
+    }
+
+    /// Create a new model loading cancelled error
+    pub fn model_loading_cancelled<S: Into<String>>(model: S) -> Self {
+        Self::ModelLoadingCancelled(model.into())
     }
 
     /// Create a new remote call failed error

@@ -301,7 +301,17 @@ impl LMStudioClient {
 
         // Check if already loaded
         if self.is_model_already_loaded(model_identifier).await {
-            return Err(LMStudioError::ModelAlreadyLoaded(model_identifier.to_string()));
+            self.logger.info(&format!("Model {} is already loaded", model_identifier));
+
+            // Get model info for the callback
+            let model_info = self.get_model_info(model_identifier).await.ok();
+
+            // Call progress callback with 100% completion for already loaded model
+            if let Some(callback) = progress_callback {
+                callback(1.0, model_info.as_ref());
+            }
+
+            return Ok(());
         }
 
         // Create loading channel
@@ -344,7 +354,7 @@ impl LMStudioClient {
             } => result,
             _ = cancellation_token.cancelled() => {
                 self.logger.debug("Model loading cancelled by user");
-                return Err(LMStudioError::other("Model loading cancelled by user"));
+                return Err(LMStudioError::other(""));
             }
         };
 
@@ -360,6 +370,28 @@ impl LMStudioClient {
                 "Model loading timeout after {:?}: {}", load_timeout, model_identifier
             ))),
         }
+    }
+
+    /// Get model information for a given identifier
+    async fn get_model_info(&self, model_identifier: &str) -> Result<Model> {
+        // First try loaded models
+        let loaded_models = self.list_loaded_llms().await?;
+        for model in &loaded_models {
+            if model.model_key == model_identifier ||
+               model.identifier.as_ref() == Some(&model_identifier.to_string()) {
+                return Ok(model.clone());
+            }
+        }
+
+        // Then try downloaded models
+        let downloaded_models = self.list_downloaded_models().await?;
+        for model in &downloaded_models {
+            if model.model_key == model_identifier {
+                return Ok(model.clone());
+            }
+        }
+
+        Err(LMStudioError::ModelNotFound(model_identifier.to_string()))
     }
 
     /// Load a model with progress reporting, timeout, and external cancellation support
@@ -378,7 +410,17 @@ impl LMStudioClient {
 
         // Check if already loaded
         if self.is_model_already_loaded(model_identifier).await {
-            return Err(LMStudioError::ModelAlreadyLoaded(model_identifier.to_string()));
+            self.logger.info(&format!("Model {} is already loaded", model_identifier));
+
+            // Get model info for the callback
+            let model_info = self.get_model_info(model_identifier).await.ok();
+
+            // Call progress callback with 100% completion for already loaded model
+            if let Some(callback) = progress_callback {
+                callback(1.0, model_info.as_ref());
+            }
+
+            return Ok(());
         }
 
         // Create loading channel
@@ -413,7 +455,7 @@ impl LMStudioClient {
                         if cancellation_signal.load(Ordering::SeqCst) {
                             self.logger.debug("External cancellation signal received");
                             let _ = channel.cancel().await;
-                            return Err(LMStudioError::other("Model loading cancelled by user"));
+                            return Err(LMStudioError::model_loading_cancelled(model_identifier));
                         }
 
                         if let Some(ref callback) = progress_callback {
